@@ -23,8 +23,8 @@ jobs:
       - name: Check out school repository
         uses: actions/checkout@v4
         with:
-          repository: JoshuaKim2009/Club-Connect-school
-          token: ${{ secrets.SECONDARY_REPO_TOKEN }}
+          repository: JoshuaKim2009/Club-Connect-School
+          token: ${{ secrets.CLUB_CONNECT_SCHOOL_REPO_TOKEN }}
           path: destination
 
       - name: Copy website files
