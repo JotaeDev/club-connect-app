@@ -1,0 +1,47 @@
+
+name: Sync school copy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out original repository
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Check out school repository
+        uses: actions/checkout@v4
+        with:
+          repository: JoshuaKim2009/Club-Connect-school
+          token: ${{ secrets.SECONDARY_REPO_TOKEN }}
+          path: destination
+
+      - name: Copy website files
+        run: |
+          rsync -av --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='CNAME' \
+            source/ destination/
+
+      - name: Push changes
+        working-directory: destination
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || (
+            git commit -m "Sync from original"
+            git push origin main
+          )
