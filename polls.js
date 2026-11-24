@@ -1,0 +1,942 @@
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
+import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, getDoc, collection, addDoc, updateDoc, deleteDoc, serverTimestamp, onSnapshot, query, orderBy } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-firestore.js";
+import { runTransaction } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-firestore.js";
+import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-auth.js";
+import { showAppAlert, showAppConfirm } from './dialog.js'; 
+import { ROLE_LABELS } from './roleLabels.js';
+import { handleUserSwitch } from './auth-guard.js';
+import { getRole } from './roleCache.js';
+
+const editTypeInfo = document.getElementById('poll-edit-type-info');
+if (editTypeInfo) editTypeInfo.textContent = `Users will always see poll percentages. The creator of the poll and ${ROLE_LABELS.manager.toLowerCase()} can always see results.`;
+
+const firebaseConfig = {
+    apiKey: "AIzaSyCBFod3ng-pAEdQyt-sCVgyUkq-U8AZ65w",
+    authDomain: "club-connect-data.firebaseapp.com",
+    projectId: "club-connect-data",
+    storageBucket: "club-connect-data.firebasestorage.app",
+    messagingSenderId: "903230180616",
+    appId: "1:903230180616:web:a13856c505770bcc0b30bd",
+    measurementId: "G-B8DR377JX6"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+function formatTimestamp(timestamp) {
+    if (!timestamp || !timestamp.toDate) return 'N/A';
+    const date = timestamp.toDate();
+    return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+let role = null;
+let currentUser = null;
+let pendingScrollToNew = false;
+let pendingEditingCardToRemove = null;
+let currentMemberUIDs = new Set();
+const votesInFlight = new Set();
+
+const addPollButton = document.getElementById('add-poll-button');
+const noPollsMessageAdmin = document.getElementById('no-polls-message-admin');
+document.getElementById('empty-state-poll-btn').addEventListener('click', createPollEditingCard);
+document.body.classList.add('no-scroll');
+
+const visMessages = {
+    Before: `Everyone can see the results at any time, even before they vote. The creator of the poll and ${ROLE_LABELS.manager.toLowerCase()} can always see results.`,
+    After:  `Results are hidden until a member votes, after which they can see them. The creator of the poll and ${ROLE_LABELS.manager.toLowerCase()} can always see results.`,
+    Never:  `Results are always hidden from members no matter what they do. The creator of the poll and ${ROLE_LABELS.manager.toLowerCase()} can always see results.`
+};
+
+const pollDataCache = new Map(); 
+
+let memberNames = {};
+const pendingNameFetches = new Set();
+
+function lookupName(uid) {
+    return memberNames[uid] || "Unknown";
+}
+
+function refreshAuthorNames(uid) {
+    document.querySelectorAll('.poll-card[data-poll-id]').forEach(card => {
+        const data = pollDataCache.get(card.dataset.pollId);
+        if (!data || data.createdByUid !== uid) return;
+        const span = card.querySelector('.poll-meta span');
+        if (span) span.textContent = `${lookupName(uid)} · ${formatTimestamp(data.createdAt)}`;
+    });
+}
+
+async function resolveMissingName(uid) {
+    if (!uid || memberNames[uid] || pendingNameFetches.has(uid)) return;
+    pendingNameFetches.add(uid);
+    try {
+        const userSnap = await getDoc(doc(db, "users", uid));
+        memberNames[uid] = (userSnap.exists() && userSnap.data().name) ? userSnap.data().name : "Unknown";
+        refreshAuthorNames(uid);
+    } catch (error) {
+        console.error(`Failed to resolve name for ${uid}:`, error);
+        pendingNameFetches.delete(uid);
+    }
+}
+
+const clubId = getUrlParameter('clubId');
+
+function getUrlParameter(name) {
+    const params = new URLSearchParams(window.location.search);
+    return params.get(name) || '';
+}
+
+
+window.goToClubPage = function() {
+    const currentClubId = getUrlParameter('clubId');
+    window.location.href = currentClubId
+        ? `club_page.html?clubId=${currentClubId}`
+        : 'your_clubs.html';
+}
+
+function hideLoadingScreen() {
+    const overlay = document.getElementById('loading-overlay');
+    const content = document.getElementById('content');
+    const pollsContainer = document.getElementById('polls-container');
+    if (overlay) {
+        overlay.classList.add('hidden');
+        document.body.classList.remove('no-scroll');
+        overlay.addEventListener('transitionend', () => {
+            if (overlay.classList.contains('hidden')) overlay.style.display = 'none';
+        }, { once: true });
+    } else {
+        document.body.classList.remove('no-scroll');
+    }
+    if (content) {
+        content.style.display = 'block';
+        Array.from(content.querySelectorAll(':scope > *')).forEach((item, i) => {
+            if (item === pollsContainer || item === addPollButton) {
+                item.classList.add('revealed-child');
+            } else {
+                setTimeout(() => item.classList.add('revealed-child'), i * 200);
+            }
+        });
+    }
+}
+
+onAuthStateChanged(auth, async (user) => {
+    if (!handleUserSwitch(user)) {
+        if (!user) window.location.href = 'login.html';
+        return;
+    }
+    if (user) {
+        currentUser = user;
+
+        if (!clubId) {
+            window.location.href = 'your_clubs.html';
+            return;
+        }
+
+        const pollsContainer = document.getElementById('polls-container');
+        const noPollsMessage = document.getElementById('no-polls-message');
+
+        try {
+            const clubSnap = await getDoc(doc(db, "clubs", clubId));
+
+            if (!clubSnap.exists()) {
+                hideLoadingScreen();
+                if (noPollsMessage) noPollsMessage.style.display = 'none';
+                showContainerError(pollsContainer, "This club doesn't exist.");
+                if (addPollButton) addPollButton.style.display = 'none';
+                return;
+            }
+
+            currentMemberUIDs = new Set(clubSnap.data().memberUIDs || []);
+            memberNames = { ...(clubSnap.data().memberNames || {}) };
+
+            role = await getRole(db, clubId, currentUser.uid, clubSnap);
+
+            if (role === null) {
+                hideLoadingScreen();
+                if (noPollsMessage) noPollsMessage.style.display = 'none';
+                showContainerError(pollsContainer, "You're not a member of this club.");
+                if (addPollButton) addPollButton.style.display = 'none';
+                return;
+            }
+
+            if (addPollButton && (role === 'manager' || role === 'admin')) {
+                addPollButton.removeEventListener('click', createPollEditingCard);
+                addPollButton.addEventListener('click', createPollEditingCard);
+            }
+
+            setupRealtimePollsListener();
+
+        } catch (error) {
+            hideLoadingScreen();
+            console.error("Error:", error);
+            if (noPollsMessage) noPollsMessage.style.display = 'none';
+            showContainerError(pollsContainer, "Oops! Something went wrong.", true);
+            if (addPollButton) addPollButton.style.display = 'none';
+        }
+    } else {
+        window.location.href = 'login.html';
+    }
+});
+
+async function createPollEditingCard() {
+    if (document.querySelector('.editing-poll-card')) {
+        await showAppAlert("Please finish the current poll before adding a new one.");
+        return;
+    }
+    const pollsContainer = document.getElementById('polls-container');
+    const isFirstCard = pollsContainer.children.length === 0;
+    const card = _createPollEditingCardElement(isFirstCard);
+    const noPollsMessage = document.getElementById('no-polls-message');
+    if (noPollsMessage) noPollsMessage.style.display = 'none';
+    if (noPollsMessageAdmin) noPollsMessageAdmin.style.display = 'none';
+    pollsContainer.insertBefore(card, pollsContainer.firstChild);
+}
+
+function _createPollEditingCardElement(isFirstCard = false) {
+    const card = document.createElement('div');
+    card.className = isFirstCard ? 'poll-card editing-poll-card editing-poll-card-first' : 'poll-card editing-poll-card';
+
+    card.innerHTML = `
+        <h3>NEW POLL</h3>
+        <div class="poll-section-box">
+            <label style="font-size:20px;margin-bottom:6px;">Question</label>
+            <textarea class="poll-option-input poll-title-input-inline" placeholder="Ask a question" rows="1"></textarea>
+        </div>
+
+        <div class="poll-options-selection">
+            <label>Show results to voter:</label>
+            <div class="vis-strip-group">
+                <div class="vis-strip" data-value="Before">
+                    <span class="vis-strip-title">BEFORE</span>
+                    <span class="vis-strip-sub">${visMessages.Before}</span>
+                </div>
+                <div class="vis-strip" data-value="After">
+                    <span class="vis-strip-title">AFTER</span>
+                    <span class="vis-strip-sub">${visMessages.After}</span>
+                </div>
+                <div class="vis-strip" data-value="Never">
+                    <span class="vis-strip-title">NEVER</span>
+                    <span class="vis-strip-sub">${visMessages.Never}</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="poll-section-box">
+            <label style="font-size:20px;margin-bottom:6px;">Options</label>
+            <div class="poll-options-list-inline" style="display:flex;flex-direction:column;gap:8px;">
+                <div class="poll-option-row"><textarea class="poll-option-input" placeholder="Option 1" rows="1"></textarea></div>
+                <div class="poll-option-row"><textarea class="poll-option-input" placeholder="Option 2" rows="1"></textarea></div>
+            </div>
+
+            <button class="subtract-option-inline-btn" disabled>
+                <i class="fa-solid fa-minus"></i>
+            </button>
+
+            <button class="add-option-inline-btn">
+                <i class="fa-solid fa-plus"></i>
+            </button>
+        </div>
+
+        <div class="poll-creation-actions">
+            <button class="post-poll-inline-btn fancy-button">POST</button>
+            <button class="cancel-poll-inline-btn fancy-button">CANCEL</button>
+        </div>
+    `;
+
+    // auto-resize on input
+    card.querySelectorAll('.poll-option-input').forEach(autoResize);
+
+    // visibility radio info text
+    const visStrips = card.querySelectorAll('.vis-strip');
+    visStrips.forEach(strip => {
+        strip.addEventListener('click', () => {
+            visStrips.forEach(s => s.classList.remove('vis-strip-selected'));
+            strip.classList.add('vis-strip-selected');
+        });
+    });
+    // add / remove option buttons
+    const optionsList = card.querySelector('.poll-options-list-inline');
+    const addBtn      = card.querySelector('.add-option-inline-btn');
+    const subtractBtn = card.querySelector('.subtract-option-inline-btn');
+
+    function updateInlineOptionBtns() {
+        const count = optionsList.querySelectorAll('.poll-option-row').length;
+        addBtn.disabled      = count >= MAX_OPTIONS;
+        subtractBtn.disabled = count <= 2;
+        addBtn.style.color      = addBtn.disabled      ? '#555' : '#000';
+        subtractBtn.style.color = subtractBtn.disabled ? '#555' : '#000';
+    }
+    updateInlineOptionBtns();
+
+    addBtn.addEventListener('click', () => {
+        const count = optionsList.querySelectorAll('.poll-option-row').length;
+        if (count >= MAX_OPTIONS) return;
+        const row = document.createElement('div');
+        row.className = 'poll-option-row';
+        const ta = document.createElement('textarea');
+        ta.className = 'poll-option-input';
+        ta.placeholder = `Option ${count + 1}`;
+        ta.rows = 1;
+        row.appendChild(ta);
+        optionsList.appendChild(row);
+        autoResize(ta);
+        // ta.focus();
+        updateInlineOptionBtns();
+    });
+
+    subtractBtn.addEventListener('click', () => {
+        const rows = optionsList.querySelectorAll('.poll-option-row');
+        if (rows.length <= 2) return;
+        rows[rows.length - 1].remove();
+        updateInlineOptionBtns();
+    });
+
+    // POST
+    card.querySelector('.post-poll-inline-btn').addEventListener('click', async () => {
+        const title   = card.querySelector('.poll-title-input-inline').value.trim();
+        const options = [...card.querySelectorAll('.poll-options-list-inline .poll-option-input')]
+            .map(i => i.value.trim()).filter(Boolean).map(text => ({ text, votes: [] }));
+        const visibility = card.querySelector('.vis-strip-selected')?.dataset.value;
+        if (!visibility) {
+            await showAppAlert("Please select a visibility option!"); return;
+        }
+
+        if (!title)            { await showAppAlert("Poll title is required!");                  return; }
+        if (options.length < 2){ await showAppAlert("Please provide at least 2 poll options!"); return; }
+
+        try {
+            pendingScrollToNew = true;
+            pendingEditingCardToRemove = card;
+            await addDoc(collection(db, "clubs", clubId, "polls"), {
+                title, options, visibility,
+                createdAt:     serverTimestamp(),
+                createdByUid:  currentUser.uid,
+                clubId, isActive: true
+            });
+            updateLastSeenPolls();
+            // showAppAlert("Poll created successfully!");
+        } catch (err) {
+            pendingEditingCardToRemove = null;
+            pendingScrollToNew = false;
+            console.error("Error creating poll:", err);
+            if (isPermissionError(err)) {
+                await showAppAlert(permissionDeniedMessage("create polls"));
+            } else {
+                await showAppAlert("Something went wrong while creating this poll.");
+            }
+        }
+    });
+
+    card.querySelector('.cancel-poll-inline-btn').addEventListener('click', () => {
+        card.remove();
+        const pollsContainer = document.getElementById('polls-container');
+        const noPollsMessage = document.getElementById('no-polls-message');
+        const isEmpty = pollsContainer.querySelectorAll('.poll-card:not(.editing-poll-card)').length === 0;
+        if (isEmpty) {
+            const isAdmin = role === 'manager' || role === 'admin';
+            if (isAdmin) {
+                if (noPollsMessageAdmin) noPollsMessageAdmin.style.display = 'block';
+            } else if (noPollsMessage) {
+                noPollsMessage.style.display = 'block';
+            }
+        }
+        window.scrollTo({ top: 0, behavior: 'smooth' }); 
+    });
+
+    return card;
+}
+
+function autoResize(textarea) {
+    textarea.style.height = 'auto';
+    textarea.style.height = textarea.scrollHeight + 'px';
+}
+
+document.addEventListener('input', (e) => {
+    if (e.target.classList.contains('poll-option-input')) {
+        autoResize(e.target);
+    }
+});
+
+const MAX_OPTIONS = 10;
+
+let pollsListenerUnsubscribe = null;
+
+function setupRealtimePollsListener() {
+    if (!clubId) return;
+    if (pollsListenerUnsubscribe) { pollsListenerUnsubscribe(); pollsListenerUnsubscribe = null; }
+
+    const pollsRef = collection(db, "clubs", clubId, "polls");
+    const q = query(pollsRef, orderBy("createdAt", "desc"));
+
+    let isInitialSnapshot = true;
+
+    pollsListenerUnsubscribe = onSnapshot(q, async (querySnapshot) => {
+        const pollsContainer = document.getElementById('polls-container');
+
+        const wasInitial = isInitialSnapshot;
+        isInitialSnapshot = false;
+
+        if (wasInitial) {
+            const missingUids = [...new Set(
+                querySnapshot.docs
+                    .map(d => d.data().createdByUid)
+                    .filter(uid => uid && !memberNames[uid])
+            )];
+            if (missingUids.length > 0) {
+                await Promise.all(missingUids.map(uid => resolveMissingName(uid)));
+            }
+        }
+
+        querySnapshot.docChanges().forEach((change) => {
+            const pollData = change.doc.data({ serverTimestamps: 'estimate' });
+            const pollId = change.doc.id;
+
+            if (change.type === "added" || change.type === "modified") {
+                pollDataCache.set(pollId, pollData);
+                if (!wasInitial) resolveMissingName(pollData.createdByUid);
+            } else if (change.type === "removed") {
+                pollDataCache.delete(pollId);
+            }
+
+            if (change.type === "added") {
+                const pollCard = createPollCard(pollData, pollId);
+                if (wasInitial) {
+                    pollsContainer.appendChild(pollCard);
+                    animateCardIn(pollCard, pollsContainer.children.length - 1);
+                } else {
+                    if (pendingEditingCardToRemove) {
+                        pendingEditingCardToRemove.remove();
+                        pendingEditingCardToRemove = null;
+                    }
+                    pollsContainer.insertBefore(pollCard, pollsContainer.firstChild);
+                    animateCardIn(pollCard, 0);
+                    if (pendingScrollToNew) {
+                        pendingScrollToNew = false;
+                        requestAnimationFrame(() => scrollToPoll(pollId));
+                    }
+                }
+            } else if (change.type === "modified") {
+                const existingCard = pollsContainer.querySelector(`[data-poll-id="${pollId}"]`);
+                if (existingCard) updatePollCard(existingCard, pollData, pollId);
+            } else if (change.type === "removed") {
+                const existingCard = pollsContainer.querySelector(`[data-poll-id="${pollId}"]`);
+                if (existingCard) existingCard.remove();
+            }
+        });
+
+        const noPollsMessage = document.getElementById('no-polls-message');
+        const isAdmin = role === 'manager' || role === 'admin';
+        const isEmpty = pollsContainer.children.length === 0;
+
+        const desiredMargin = isEmpty ? '0px' : (isAdmin ? '0px' : '-45px');
+        if (pollsContainer.style.marginTop !== desiredMargin) {
+            pollsContainer.style.marginTop = desiredMargin;
+        }
+
+        if (noPollsMessage) {
+            const desiredDisplay = (isEmpty && !isAdmin) ? 'block' : 'none';
+            if (desiredDisplay === 'block') noPollsMessage.textContent = 'NO POLLS YET';
+            if (noPollsMessage.style.display !== desiredDisplay) {
+                noPollsMessage.style.display = desiredDisplay;
+            }
+        }
+
+        if (noPollsMessageAdmin) {
+            const desiredDisplay = (isEmpty && isAdmin) ? 'block' : 'none';
+            if (noPollsMessageAdmin.style.display !== desiredDisplay) {
+                noPollsMessageAdmin.style.display = desiredDisplay;
+            }
+        }
+
+        if (addPollButton && isAdmin) {
+            const desiredDisplay = isEmpty ? 'none' : 'block';
+            if (addPollButton.style.display !== desiredDisplay) {
+                addPollButton.style.display = desiredDisplay;
+            }
+        }
+
+        if (wasInitial) {
+            hideLoadingScreen();
+            updateLastSeenPolls();
+        }
+    }, (error) => { console.error("Error fetching realtime polls:", error); });
+}
+
+//redraws the card with the vote the user chose before Firestore confirms so it feels instant instead of slow
+function applyOptimisticVote(card, pollData, optionIndex, userUid) {
+    const options = pollData.options.map(opt => ({
+        ...opt,
+        votes: [...opt.votes]
+    }));
+
+    let previousVoteIndex = -1;
+    options.forEach((opt, i) => {
+        if (opt.votes.includes(userUid)) previousVoteIndex = i;
+    });
+
+    if (previousVoteIndex === optionIndex) {
+        options[optionIndex].votes = options[optionIndex].votes.filter(uid => uid !== userUid);
+    } else {
+        if (previousVoteIndex !== -1) {
+            options[previousVoteIndex].votes = options[previousVoteIndex].votes.filter(uid => uid !== userUid);
+        }
+        options[optionIndex].votes.push(userUid);
+    }
+
+    updatePollCard(card, { ...pollData, options }, card.dataset.pollId);
+}
+
+function createPollCard(pollData, pollId) {
+    const card = document.createElement('div');
+    card.className = 'poll-card';
+    card.dataset.pollId = pollId;
+
+    const totalVotes = pollData.options.reduce((sum, opt) => sum + getValidVotes(opt.votes).length, 0);
+    const userHasVoted = pollData.options.some(opt => opt.votes.includes(currentUser.uid));
+    
+    let canSeeResults = false;
+    if (pollData.visibility === "Before") {
+        canSeeResults = true;
+    } else if (pollData.visibility === "After") {
+        canSeeResults = userHasVoted;
+    } else if (pollData.visibility === "Never") {
+        canSeeResults = false;
+    }
+    
+    if (((role === 'manager' || role === 'admin') && (pollData.createdByUid === currentUser.uid)) || (role === 'manager')) {
+        canSeeResults = true;
+    }
+
+    let optionsHTML = '<div class="poll-options-list">';
+    pollData.options.forEach((option, index) => {
+        const voteCount = getValidVotes(option.votes).length;
+        const percentage = totalVotes > 0 ? ((voteCount / totalVotes) * 100).toFixed(1) : 0;
+        const userVotedForThis = option.votes.includes(currentUser.uid);
+
+        optionsHTML += `
+            <div class="poll-option-item" data-option-index="${index}">
+                <div class="poll-option-header">
+                    <label class="poll-option-label">
+                        <input type="radio" 
+                                name="poll-${pollId}-${currentUser.uid}"  
+                                class="poll-radio" 
+                                data-poll-id="${pollId}" 
+                                data-option-index="${index}"
+                                ${userVotedForThis ? 'checked' : ''}>
+                        <span class="poll-option-text">${escapeHtml(option.text)}</span>
+                        ${canSeeResults ? `<span class="poll-vote-count">${voteCount} vote${voteCount !== 1 ? 's' : ''}</span>` : ''}
+                    </label>
+                </div>
+                ${canSeeResults ? `
+                    <div class="poll-results-bar">
+                        <div class="poll-bar" style="width: ${percentage}%"></div>
+                        <span class="poll-percentage">${percentage}%</span>
+                    </div>
+                ` : ''}
+            </div>
+        `;
+    });
+    optionsHTML += '</div>';
+
+    card.innerHTML = `
+        <h3>${escapeHtml(pollData.title)}</h3>
+        ${optionsHTML}
+        <div class="poll-meta-row">
+            <div class="poll-meta">
+                <span>${escapeHtml(lookupName(pollData.createdByUid))} · ${formatTimestamp(pollData.createdAt)}</span>
+            </div>
+            ${pollData.createdByUid === currentUser.uid ? `
+                <div class="poll-actions">
+                    <button class="edit-poll-btn" data-poll-id="${pollId}">
+                        <i class="fa-solid fa-pencil"></i>
+                    </button>
+                    <button class="delete-poll-btn" data-poll-id="${pollId}">
+                        <i class="fa-solid fa-trash"></i>
+                    </button>
+                </div>
+            ` : ''}
+        </div>
+    `;
+
+    card.querySelectorAll('.poll-radio').forEach(radio => {
+        radio.addEventListener('click', (e) => {
+            const clickedRadio = e.currentTarget;
+            const pollId = clickedRadio.dataset.pollId;
+            if (votesInFlight.has(pollId)) return;
+            const optionIndex = parseInt(clickedRadio.dataset.optionIndex);
+            const currentPollData = pollDataCache.get(pollId);
+            if (clickedRadio.dataset.wasChecked === 'true') {
+                clickedRadio.checked = false;
+                clickedRadio.dataset.wasChecked = 'false';
+                if (currentPollData) applyOptimisticVote(card, currentPollData, optionIndex, currentUser.uid);
+                handleVote(pollId, optionIndex);
+            } else {
+                card.querySelectorAll('.poll-radio').forEach(r => {
+                    r.dataset.wasChecked = 'false';
+                });
+                clickedRadio.dataset.wasChecked = 'true';
+                if (currentPollData) applyOptimisticVote(card, currentPollData, optionIndex, currentUser.uid);
+                handleVote(pollId, optionIndex);
+            }
+        });
+        
+        if (radio.checked) {
+            radio.dataset.wasChecked = 'true';
+        } else {
+            radio.dataset.wasChecked = 'false';
+        }
+    });
+
+    const deleteBtn = card.querySelector('.delete-poll-btn');
+    if (deleteBtn) {
+        deleteBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const pollId = e.currentTarget.dataset.pollId;
+            deletePoll(pollId);
+        });
+    }
+
+    const editBtn = card.querySelector('.edit-poll-btn');
+    if (editBtn) {
+        editBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const pollId = e.currentTarget.dataset.pollId;
+            editPoll(pollId, pollData);
+        });
+    }
+
+    return card;
+}
+
+function updatePollCard(existingCard, pollData, pollId) {
+    const totalVotes = pollData.options.reduce((sum, opt) => sum + getValidVotes(opt.votes).length, 0);
+    const userHasVoted = pollData.options.some(opt => opt.votes.includes(currentUser.uid));
+    
+    let canSeeResults = false;
+    if (pollData.visibility === "Before") {
+        canSeeResults = true;
+    } else if (pollData.visibility === "After") {
+        canSeeResults = userHasVoted;
+    } else if (pollData.visibility === "Never") {
+        canSeeResults = false;
+    }
+    
+    if (((role === 'manager' || role === 'admin') && (pollData.createdByUid === currentUser.uid)) || (role === 'manager')) {
+        canSeeResults = true;
+    }
+
+    pollData.options.forEach((option, index) => {
+        const optionElement = existingCard.querySelector(`[data-option-index="${index}"]`);
+        if (!optionElement) return;
+
+        const voteCount = getValidVotes(option.votes).length;
+        const percentage = totalVotes > 0 ? ((voteCount / totalVotes) * 100).toFixed(1) : 0;
+        const userVotedForThis = option.votes.includes(currentUser.uid);
+
+        const radio = optionElement.querySelector('.poll-radio');
+        if (radio) {
+            radio.checked = userVotedForThis;
+            radio.dataset.wasChecked = userVotedForThis ? 'true' : 'false';
+        }
+
+        const voteCountElement = optionElement.querySelector('.poll-vote-count');
+        if (canSeeResults) {
+            if (voteCountElement) {
+                voteCountElement.textContent = `${voteCount} vote${voteCount !== 1 ? 's' : ''}`;
+            } else {
+                const label = optionElement.querySelector('.poll-option-label');
+                const span = document.createElement('span');
+                span.className = 'poll-vote-count';
+                span.textContent = `${voteCount} vote${voteCount !== 1 ? 's' : ''}`;
+                span.style.opacity = '0';
+                span.style.transition = 'opacity 0.35s ease-out';
+                label.appendChild(span);
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    span.style.opacity = '1';
+                }));
+            }
+        } else {
+            if (voteCountElement) {
+                voteCountElement.remove();
+            }
+        }
+
+        const resultsBar = optionElement.querySelector('.poll-results-bar');
+        if (canSeeResults) {
+            if (resultsBar) {
+                const bar = resultsBar.querySelector('.poll-bar');
+                const percentageSpan = resultsBar.querySelector('.poll-percentage');
+                bar.style.width = `${percentage}%`;
+                percentageSpan.textContent = `${percentage}%`;
+            } else {
+                const barHTML = `
+                    <div class="poll-results-bar">
+                        <div class="poll-bar" style="width: 0%; transition: width 0.5s cubic-bezier(.22,.9,.34,1)"></div>
+                        <span class="poll-percentage" style="opacity:0; transition: opacity 0.35s ease-out">${percentage}%</span>
+                    </div>
+                `;
+                optionElement.querySelector('.poll-option-header').insertAdjacentHTML('afterend', barHTML);
+                const newBar = optionElement.querySelector('.poll-bar');
+                const newPct = optionElement.querySelector('.poll-percentage');
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    newBar.style.width = `${percentage}%`;
+                    newPct.style.opacity = '1';
+                }));
+            }
+        } else {
+            if (resultsBar) {
+                resultsBar.remove();
+            }
+        }
+    });
+
+    const metaElement = existingCard.querySelector('.poll-meta');
+    if (metaElement) {
+        metaElement.innerHTML = `<span>${escapeHtml(lookupName(pollData.createdByUid))} · ${formatTimestamp(pollData.createdAt)}</span>`;
+    }
+}
+
+window.addEventListener('beforeunload', () => {
+    if (pollsListenerUnsubscribe) {
+        pollsListenerUnsubscribe();
+    }
+});
+
+
+async function handleVote(pollId, optionIndex) {
+    if (!currentUser || !clubId) {
+        await showAppAlert("You must be logged in to vote.");
+        return;
+    }
+
+    votesInFlight.add(pollId);
+
+    const pollRef = doc(db, "clubs", clubId, "polls", pollId);
+    const userUid = currentUser.uid;
+
+    try {
+        await runTransaction(db, async (transaction) => {
+            const pollSnap = await transaction.get(pollRef);
+
+            if (!pollSnap.exists()) {
+                throw new Error("Poll not found");
+            }
+
+            const pollData = pollSnap.data();
+            const options = structuredClone(pollData.options);
+
+            let previousVoteIndex = -1;
+
+            options.forEach((option, index) => {
+                if (option.votes.includes(userUid)) {
+                    previousVoteIndex = index;
+                }
+            });
+
+            if (previousVoteIndex === optionIndex) {
+                options[optionIndex].votes =
+                    options[optionIndex].votes.filter(uid => uid !== userUid);
+            } 
+            else {
+                if (previousVoteIndex !== -1) {
+                    options[previousVoteIndex].votes =
+                        options[previousVoteIndex].votes.filter(uid => uid !== userUid);
+                }
+                options[optionIndex].votes.push(userUid);
+            }
+
+            transaction.update(pollRef, { options });
+        });
+
+    } catch (error) {
+        console.error("Transaction failed:", error);
+        if (isPermissionError(error)) {
+            await showAppAlert(permissionDeniedMessage("vote on this poll"));
+        } else {
+            await showAppAlert("Something went wrong while saving your vote.");
+        }
+    } finally {
+        votesInFlight.delete(pollId);
+    }
+}
+
+
+async function deletePoll(pollId) {
+    const confirmed = await showAppConfirm("Are you sure you want to delete this poll? This action cannot be undone.");
+    if (!confirmed) return;
+
+    try {
+        const pollRef = doc(db, "clubs", clubId, "polls", pollId);
+        await deleteDoc(pollRef);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        // showAppAlert("Poll deleted successfully!");
+    } catch (error) {
+        console.error("Error deleting poll:", error);
+        if (isPermissionError(error)) {
+            await showAppAlert(permissionDeniedMessage("delete polls"));
+        } else {
+            await showAppAlert("Something went wrong while deleting this poll.");
+        }
+    }
+}
+
+async function editPoll(pollId, pollData) {
+    const existingCard = document.querySelector(`[data-poll-id="${pollId}"]`);
+    if (!existingCard) return;
+
+    const editCard = document.createElement('div');
+    editCard.className = 'poll-card editing-poll-card';
+    editCard.innerHTML = `
+        <h3>${escapeHtml(pollData.title)}</h3>
+        <div class="poll-options-selection" style="margin-top:12px;">
+            <label>Show results to voter:</label>
+            <div class="vis-strip-group">
+                <div class="vis-strip" data-value="Before">
+                    <span class="vis-strip-title">BEFORE</span>
+                    <span class="vis-strip-sub">${visMessages.Before}</span>
+                </div>
+                <div class="vis-strip" data-value="After">
+                    <span class="vis-strip-title">AFTER</span>
+                    <span class="vis-strip-sub">${visMessages.After}</span>
+                </div>
+                <div class="vis-strip" data-value="Never">
+                    <span class="vis-strip-title">NEVER</span>
+                    <span class="vis-strip-sub">${visMessages.Never}</span>
+                </div>
+            </div>
+        </div>
+        <div class="poll-creation-actions">
+            <button class="save-edit-inline-btn fancy-button">SAVE</button>
+            <button class="cancel-edit-inline-btn fancy-button">CANCEL</button>
+        </div>
+    `;
+
+    // pre-check current visibility
+    const editVisStrips = editCard.querySelectorAll('.vis-strip');
+    editVisStrips.forEach(strip => {
+        strip.addEventListener('click', () => {
+            editVisStrips.forEach(s => s.classList.remove('vis-strip-selected'));
+            strip.classList.add('vis-strip-selected');
+        });
+    });
+
+    const currentVisibility = pollData.visibility || 'After';
+
+    const selectedStrip = editCard.querySelector(`.vis-strip[data-value="${currentVisibility}"]`);
+    if (selectedStrip) {
+        selectedStrip.classList.add('vis-strip-selected');
+    }
+
+    editCard.querySelector('.save-edit-inline-btn').addEventListener('click', async () => {
+        const selected = editCard.querySelector('.vis-strip-selected')?.dataset.value || 'After';
+        try {
+            await updateDoc(doc(db, "clubs", clubId, "polls", pollId), { visibility: selected });
+            editCard.replaceWith(existingCard);
+            scrollToPoll(pollId);
+        } catch (err) {
+            if (isPermissionError(err)) {
+                await showAppAlert(permissionDeniedMessage("edit polls"));
+            } else {
+                await showAppAlert("Something went wrong while updating this poll.");
+            }
+        }
+    });
+
+    editCard.querySelector('.cancel-edit-inline-btn').addEventListener('click', () => {
+        editCard.replaceWith(existingCard);
+        requestAnimationFrame(() => {
+            scrollToPoll(pollId);
+        });
+    });
+
+    existingCard.replaceWith(editCard);
+}
+
+
+async function updateLastSeenPolls() {
+    if (!currentUser || !clubId) return;
+
+    const memberDocRef = doc(db, "clubs", clubId, "members", currentUser.uid);
+
+    try {
+        await updateDoc(memberDocRef, {
+            lastSeenPolls: serverTimestamp()
+        });
+        console.log("Updated lastSeenPolls timestamp");
+    } catch (error) {
+        console.error("Failed to update lastSeenPolls:", error);
+    }
+}
+
+function animateCardIn(card, index = 0) {
+    card.style.opacity = '0';
+    card.style.transform = 'translateY(16px)';
+    card.style.transition = 'opacity 0.4s ease-out, transform 0.4s ease-out';
+
+    setTimeout(() => {
+        card.style.opacity = '1';
+        card.style.transform = 'translateY(0)';
+    }, index * 80);
+}
+
+
+function showContainerError(container, message, showRetry = false) {
+    if (!container) return;
+    container.innerHTML = `
+        <div style="text-align: center; padding: 20px;">
+            <p class="fancy-label">${message}</p>
+            <div style="display: flex; justify-content: center; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
+                ${showRetry
+                    ? `<button class="fancy-button" onclick="window.location.reload()" style="font-size: 24px;">TRY AGAIN</button>`
+                    : `<button class="fancy-button" onclick="window.location.href='your_clubs.html'" style="font-size: 24px;">GO TO MY CLUBS</button>`
+                }
+            </div>
+        </div>
+    `;
+}
+
+
+function getValidVotes(votes) {
+    // ignores votes from users who left the club
+    return votes.filter(uid => currentMemberUIDs.has(uid));
+}
+
+
+// Gets position from top of document using offsetTop which ignores CSS transforms so I get the card's final position even mid animation
+function documentTopOf(el) {
+    let y = 0;
+    for (let node = el; node; node = node.offsetParent) y += node.offsetTop;
+    return y;
+}
+
+function scrollToPoll(pollId) {
+    const card = document.querySelector(`.poll-card[data-poll-id="${pollId}"]`);
+    if (!card) return;
+
+    const headerHeight = document.querySelector('.chat-header').offsetHeight;
+    const top = documentTopOf(card);
+    const bottom = top + card.offsetHeight;
+
+    const viewTop = window.pageYOffset + headerHeight;
+    const viewBottom = window.pageYOffset + window.innerHeight;
+    if (top >= viewTop && bottom <= viewBottom) return;
+
+    window.scrollTo({ top: top - 52, behavior: 'smooth' });
+}
+
+function isPermissionError(error) {
+    return error && error.code === 'permission-denied';
+}
+
+function permissionDeniedMessage(actionPhrase) {
+    return `You don't have permission to ${actionPhrase}. Try reloading the page, and reach out to a club ${ROLE_LABELS.manager.toLowerCase()} if you think this is a mistake.`;
+}
+
+function escapeHtml(str) {
+    return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}

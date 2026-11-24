@@ -1,0 +1,850 @@
+//club_edit_page.js
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
+import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-auth.js";
+import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, getDoc, updateDoc, serverTimestamp, deleteDoc, query, collection, getDocs, arrayRemove, arrayUnion } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-firestore.js";
+import { showAppAlert, showAppConfirm } from './dialog.js';
+import { ROLE_LABELS } from './roleLabels.js';
+import { handleUserSwitch } from './auth-guard.js';
+import { getOrCreateSchool, fetchSchoolsForCounty, normalizeSchoolName } from './school-utils.js';
+import { cacheRole } from './roleCache.js';
+import { validateRequiredFields } from './validation-utils.js';
+import { initTagInput } from './tag-input.js';
+import { getClubEmbeddings } from './embedding-utils.js';
+
+const firebaseConfig = {
+    apiKey: "AIzaSyCBFod3ng-pAEdQyt-sCVgyUkq-U8AZ65w",
+    authDomain: "club-connect-data.firebaseapp.com",
+    projectId: "club-connect-data",
+    storageBucket: "club-connect-data.firebasestorage.app",
+    messagingSenderId: "903230180616",
+    appId: "1:903230180616:web:a13856c505770bcc0b30bd",
+    measurementId: "G-B8DR377JX6"
+};
+
+const app = initializeApp(firebaseConfig);
+
+const db = getFirestore(app);
+
+const auth = getAuth(app);
+
+let currentUser = null;
+let currentClubId = null;
+let originalClubData = null;
+
+document.body.classList.add('no-scroll');
+
+let COUNTIES = [];
+let CACHED_SCHOOLS = [];
+const schoolCacheByCounty = new Map();
+
+fetch('counties.json')
+    .then(res => res.json())
+    .then(data => {
+        COUNTIES = data.map(c => ({ fips: c.A, state: c.B, name: c.C }));
+    });
+
+async function loadSchoolsFor(state, county) {
+    if (!state || !county) {
+        CACHED_SCHOOLS = [];
+        return;
+    }
+    const key = `${state}|${county}`;
+    if (!schoolCacheByCounty.has(key)) {
+        schoolCacheByCounty.set(key, await fetchSchoolsForCounty(db, state, county));
+    }
+    CACHED_SCHOOLS = schoolCacheByCounty.get(key);
+}
+
+const CLUB_CATEGORIES = [
+    'Academic',
+    'Activism',
+    'Athletics',
+    'Art',
+    'Business',
+    'Community Service',
+    'Culture & Identity',
+    'Health & Wellness',
+    'Hobbies',
+    'Honor Societies',
+    'Humanities',
+    'Language',
+    'Leadership',
+    'Literature',
+    'Media',
+    'Public Speaking',
+    'STEM',
+    'Student Government',
+    'Other'
+];
+
+const categoryInput = document.getElementById("category-edit");
+const categoryDropdownList = document.getElementById("category-dropdown-list-edit");
+
+CLUB_CATEGORIES.forEach(cat => {
+    const div = document.createElement('div');
+    div.className = 'state-option';
+    div.textContent = cat;
+    div.onclick = () => {
+        categoryInput.value = cat;
+        categoryDropdownList.classList.remove('show');
+    };
+    categoryDropdownList.appendChild(div);
+});
+
+categoryInput.addEventListener('click', function() {
+    categoryDropdownList.classList.toggle('show');
+});
+
+document.addEventListener('click', function(e) {
+    if (!categoryInput.contains(e.target) && !categoryDropdownList.contains(e.target)) {
+        categoryDropdownList.classList.remove('show');
+    }
+});
+
+function getClubIdFromUrl() {
+    const urlParams = new URLSearchParams(window.location.search);
+    return urlParams.get('clubId');
+}
+currentClubId = getClubIdFromUrl();
+
+function setLoading(btn) {
+    btn._origHTML = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>';
+}
+
+function clearLoading(btn) {
+    btn.disabled = false;
+    btn.innerHTML = btn._origHTML;
+}
+
+const submitButton = document.getElementById("update-club-button");
+const schoolNameInput = document.getElementById("school-name-edit");
+const clubNameInput = document.getElementById("club-name-edit");
+const clubDescriptionInput = document.getElementById("description-edit");
+const deleteButton = document.getElementById("delete-club-button");
+const backButton = document.getElementById("back-button-edit");
+const stateInput = document.getElementById("state-edit");
+const clubSponsorInput = document.getElementById("sponsor-edit");
+const clubLeaderInput = document.getElementById("club-leader-edit");
+const schoolEmailInput = document.getElementById("school-email-edit");
+const roomNumberInput = document.getElementById("room-number-edit");
+const meetingScheduleInput = document.getElementById("meeting-schedule-edit");
+const countyInput = document.getElementById("county-edit");
+const countyDropdownList = document.getElementById("county-dropdown-list-edit");
+const clubTopicsField = document.getElementById("club-topics-edit");
+const topicsInput = initTagInput(clubTopicsField);
+
+countyInput.closest('.club-form-section').style.display = 'none';
+
+
+let selectedCountyFips = null;
+
+submitButton.disabled = true;
+schoolNameInput.disabled = true;
+clubNameInput.disabled = true;
+clubDescriptionInput.disabled = true;
+categoryInput.disabled = true;
+clubSponsorInput.disabled = true;
+clubLeaderInput.disabled = true;
+schoolEmailInput.disabled = true;
+roomNumberInput.disabled = true;
+meetingScheduleInput.disabled = true;
+countyInput.disabled = true;
+topicsInput.setDisabled(true);
+
+function hideLoadingScreen() {
+    const overlay = document.getElementById('loading-overlay');
+    const content = document.getElementById('content');
+    if (overlay) {
+        overlay.classList.add('hidden');
+        document.body.classList.remove('no-scroll');
+        overlay.addEventListener('transitionend', () => {
+            if (overlay.classList.contains('hidden')) overlay.style.display = 'none';
+        }, { once: true });
+    } else {
+        document.body.classList.remove('no-scroll');
+    }
+    if (content) {
+        content.style.display = 'block';
+        Array.from(content.querySelectorAll(':scope > *')).forEach(item => {
+            item.classList.add('revealed-child');
+        });
+    }
+}
+
+async function loadClubData(clubId, managerUid) {
+    if (!clubId) {
+        window.location.href = 'your_clubs.html';
+        return;
+    }
+
+    const clubRef = doc(db, "clubs", clubId);
+    try {
+        const clubDoc = await getDoc(clubRef);
+        if (clubDoc.exists()) {
+            const clubData = clubDoc.data();
+
+            const isManager = clubData.managerUid === managerUid;
+            let isAdminOfThisClub = false;
+
+            if (isManager) {
+                cacheRole(clubId, managerUid, 'manager');
+            } else if (managerUid) {
+                const memberDoc = await getDoc(doc(db, "clubs", clubId, "members", managerUid));
+                if (memberDoc.exists()) {
+                    const role = memberDoc.data().role || 'member';
+                    cacheRole(clubId, managerUid, role);
+                    if (role === 'admin') isAdminOfThisClub = true;
+                }
+            }
+
+            if (!isManager && !isAdminOfThisClub) {
+                hideLoadingScreen();
+                showContainerError("You don't have permission to edit this club.");
+                return;
+            }
+
+            schoolNameInput.value = clubData.schoolName || '';
+            clubNameInput.value = clubData.clubName || '';
+            clubDescriptionInput.value = clubData.description || '';
+            stateInput.value = clubData.state || '';
+            clubSponsorInput.value = clubData.clubSponsor || '';
+            clubLeaderInput.value = clubData.clubLeader || '';
+            schoolEmailInput.value = clubData.schoolEmail || '';
+            roomNumberInput.value = clubData.roomNumber || '';
+            meetingScheduleInput.value = clubData.meetingSchedule || '';
+            topicsInput.setTags(clubData.topics || []);
+            handleCountyVisibility(clubData.state || '');
+            countyInput.value = clubData.countyName || '';
+            selectedCountyFips = clubData.countyFips || null;
+            loadSchoolsFor(clubData.state || '', clubData.countyName || '');
+            const savedVis = clubData.visibility || 'public';
+            editVisStrips.forEach(s => {
+                s.classList.toggle('club-vis-strip-selected', s.dataset.value === savedVis);
+            });
+
+            schoolNameInput.disabled = false;
+            clubNameInput.disabled = false;
+            clubDescriptionInput.disabled = false;
+            submitButton.disabled = false;
+            stateInput.disabled = false;
+            categoryInput.disabled = false;
+            clubSponsorInput.disabled = false;
+            clubLeaderInput.disabled = false;
+            schoolEmailInput.disabled = false;
+            roomNumberInput.disabled = false;
+            meetingScheduleInput.disabled = false;
+            topicsInput.setDisabled(false);
+            if (!NO_COUNTY_STATES[clubData.state]) {
+                countyInput.disabled = false;
+            }
+            if (clubData.category) categoryInput.value = clubData.category;
+
+            originalClubData = {
+                schoolId: clubData.schoolId || null,
+                schoolName: clubData.schoolName || '',
+                clubName: clubData.clubName || '',
+                description: clubData.description || '',
+                state: clubData.state || '',
+                visibility: clubData.visibility || 'public',
+                category: clubData.category || '',
+                topics: clubData.topics || [],
+                clubSponsor: clubData.clubSponsor || '',
+                clubLeader: clubData.clubLeader || '',
+                schoolEmail: clubData.schoolEmail || '',
+                roomNumber: clubData.roomNumber || '',
+                meetingSchedule: clubData.meetingSchedule || '',
+                countyName: clubData.countyName || '',
+                countyFips: clubData.countyFips || null,
+            };
+
+            hideLoadingScreen();
+        } else {
+            hideLoadingScreen();
+            showContainerError("This club doesn't exist.");
+        }
+    } catch (error) {
+        console.error("Error loading club data:", error);
+        hideLoadingScreen();
+        showContainerError("Oops! Something went wrong.", true);
+    }
+}
+
+
+onAuthStateChanged(auth, async (user) => {
+    if (!handleUserSwitch(user)) {
+        if (!user) window.location.href = 'login.html';
+        return;
+    }
+
+    currentUser = user;
+
+    if (currentClubId) {
+        await loadClubData(currentClubId, currentUser.uid);
+    } else {
+        hideLoadingScreen();
+        showContainerError("No club ID provided.");
+    }
+});
+
+
+const editVisStrips = document.querySelectorAll('#visibility-strip-group-edit .club-vis-strip');
+editVisStrips.forEach(strip => {
+    strip.addEventListener('click', () => {
+        editVisStrips.forEach(s => s.classList.remove('club-vis-strip-selected'));
+        strip.classList.add('club-vis-strip-selected');
+    });
+});
+
+function getSelectedVisibilityEdit() {
+    const selected = document.querySelector('#visibility-strip-group-edit .club-vis-strip-selected');
+    return selected ? selected.dataset.value : null;
+}
+
+
+function sameTags(a, b) {
+    if (a.length !== b.length) return false;
+    const sortedA = [...a].sort();
+    const sortedB = [...b].sort();
+    return sortedA.every((t, i) => t === sortedB[i]);
+}
+
+submitButton.addEventListener("click", async function(event){
+    event.preventDefault();
+
+    submitButton.disabled = true;
+
+    if (!currentUser || !currentUser.uid) {
+      await showAppAlert("You must be logged in to update a club.");
+      console.warn("Attempted club update by unauthenticated user. Aborting.");
+      submitButton.disabled = false;
+      return;
+    }
+    if (!currentClubId) {
+        await showAppAlert("No club selected for update.");
+        console.warn("Attempted club update without a club ID. Aborting.");
+        submitButton.disabled = false;
+        return;
+    }
+
+    const rawSchoolName = schoolNameInput.value.trim();
+    const clubName = clubNameInput.value.trim();
+    const clubDescription = clubDescriptionInput.value.trim();
+    const state = stateInput.value.trim();
+    const clubSponsor = clubSponsorInput.value.trim();
+    const clubLeader = clubLeaderInput.value.trim();
+    const schoolEmail = schoolEmailInput.value.trim();
+    const roomNumber = roomNumberInput.value.trim();
+    const meetingSchedule = meetingScheduleInput.value.trim();
+    const countyName = countyInput.value.trim();
+    const countyFips = selectedCountyFips;
+    const clubCategory = categoryInput.value;
+    const clubTopics = topicsInput.getTags();
+    const clubVisibility = getSelectedVisibilityEdit();
+
+    if (
+        originalClubData &&
+        rawSchoolName === originalClubData.schoolName &&
+        clubName === originalClubData.clubName &&
+        clubDescription === originalClubData.description &&
+        state === originalClubData.state &&
+        clubVisibility === originalClubData.visibility &&
+        clubCategory === originalClubData.category && 
+        sameTags(clubTopics, originalClubData.topics) &&
+        clubSponsor === originalClubData.clubSponsor &&
+        clubLeader === originalClubData.clubLeader &&
+        schoolEmail === originalClubData.schoolEmail &&
+        roomNumber === originalClubData.roomNumber &&
+        meetingSchedule === originalClubData.meetingSchedule &&
+        countyInput.value.trim() === originalClubData.countyName &&
+        (selectedCountyFips ?? null) === (originalClubData.countyFips ?? null)
+    ) {
+        await showAppAlert("No changes were made.");
+        submitButton.disabled = false;
+        return;
+    }
+
+    const contentChanged =
+        clubDescription !== originalClubData.description ||
+        !sameTags(clubTopics, originalClubData.topics);
+
+    const normalizedState = normalizeState(state);
+    const countyRequired = state && !(normalizedState && NO_COUNTY_STATES[normalizedState]);
+
+    const requiredFields = [
+        { label: "Club Name", value: clubName },
+        { label: "School Name", value: rawSchoolName },
+        { label: "State", value: state },
+        { label: "Category", value: clubCategory },
+        { label: "Description", value: clubDescription },
+        { label: "Visibility", value: clubVisibility },
+    ];
+    if (countyRequired) {
+        requiredFields.push({ label: "County", value: countyName });
+    }
+
+    const requiredFieldsValid = await validateRequiredFields(requiredFields);
+    if (!requiredFieldsValid) {
+        submitButton.disabled = false;
+        return;
+    }
+
+    if (clubDescription.length > 1500) {
+        await showAppAlert("Description must be 1500 characters or less.");
+        submitButton.disabled = false;
+        return;
+    }
+
+    if (!normalizedState) {
+        await showAppAlert("Please enter a valid state");
+        submitButton.disabled = false;
+        return;
+    }
+
+    const schoolNameResult = normalizeSchoolName(rawSchoolName);
+    let schoolName = rawSchoolName;
+
+    if (!schoolNameResult.valid) {
+        const confirmed = await showAppConfirm(`"${rawSchoolName}" looks like an abbreviation. Click YES to continue or NO to correct it.`);
+        if (!confirmed) {
+            submitButton.disabled = false;
+            return;
+        }
+        schoolName = rawSchoolName;
+    } else {
+        if (schoolNameResult.normalized !== rawSchoolName) {
+            const confirmed = await showAppConfirm(`We recommend changing "${rawSchoolName}" to "${schoolNameResult.normalized}". Would you like to use the recommended version?`);
+            if (!confirmed) {
+                schoolName = rawSchoolName;
+            } else {
+                schoolName = schoolNameResult.normalized;
+            }
+        }
+    }
+
+    let embeddingFields = {};
+    if (contentChanged) {
+        const { descriptionEmbedding, topicsEmbedding } = await getClubEmbeddings({
+            description: clubDescription,
+            topics: clubTopics
+        });
+        embeddingFields = { descriptionEmbedding, topicsEmbedding };
+    }
+
+    setLoading(submitButton);
+
+    try {
+        console.log("Attempting to update club data in Firestore...");
+        const clubRef = doc(db, "clubs", currentClubId);
+
+        const schoolId = await getOrCreateSchool(db, normalizedState, countyName, schoolName);
+
+        await updateDoc(clubRef, {
+            schoolName: schoolName,
+            schoolId: schoolId,
+            state: normalizedState,
+            clubName: clubName,
+            clubNameLower: clubName.toLowerCase(),
+            schoolNameLower: schoolName.toLowerCase(),
+            stateLower: normalizedState.toLowerCase(),
+            description: clubDescription,
+            lastModifiedBy: currentUser.uid,
+            lastModifiedAt: serverTimestamp(),
+            visibility: clubVisibility,
+            category: clubCategory,
+            categoryLower: clubCategory.toLowerCase(),
+            topics: clubTopics,
+            clubSponsor: clubSponsor,
+            clubLeader: clubLeader,
+            schoolEmail: schoolEmail,
+            roomNumber: roomNumber,
+            meetingSchedule: meetingSchedule,
+            countyName: countyName,
+            countyFips: countyFips || null,
+            ...embeddingFields
+        });
+        console.log("Club document updated with ID: ", currentClubId);
+
+        const nameChanged = clubName !== originalClubData.clubName;
+        const schoolChanged = schoolId !== originalClubData.schoolId;
+
+        if (nameChanged || schoolChanged) {
+            if (originalClubData.schoolId) {
+                await updateDoc(doc(db, "schools", originalClubData.schoolId), {
+                    clubs: arrayRemove({ id: currentClubId, name: originalClubData.clubName })
+                });
+            }
+            await updateDoc(doc(db, "schools", schoolId), {
+                clubs: arrayUnion({ id: currentClubId, name: clubName })
+            });
+        }
+
+        clearLoading(submitButton);
+        await showAppAlert(`Club "${clubName}" updated successfully!`);
+        window.location.href = `club_page.html?clubId=${currentClubId}`;
+
+    } catch (error) {
+        console.error("Error updating club:", error);
+        clearLoading(submitButton);
+        if (isPermissionError(error)) {
+            await showAppAlert(permissionDeniedMessage("update this club"));
+        } else {
+            await showAppAlert("Something went wrong while updating your club. Please try again.");
+        }
+    }
+});
+
+
+backButton.addEventListener("click", function(){
+    window.location.href = currentClubId
+        ? `club_page.html?clubId=${currentClubId}`
+        : 'your_clubs.html';
+});
+
+
+deleteButton.addEventListener("click", async function(event){
+    event.preventDefault();
+    await deleteClub(currentClubId);
+});
+
+
+async function deleteClub(clubId) {
+    if (!currentUser || !currentUser.uid) {
+        await showAppAlert("You must be logged in to delete a club.");
+        console.warn("Attempted club deletion by unauthenticated user. Aborting.");
+        return;
+    }
+
+    if (!clubId) {
+        await showAppAlert("No club ID provided for deletion.");
+        console.warn("No clubId provided to deleteClub function.");
+        return;
+    }
+
+    try {
+        console.log(`Attempting to delete club with ID: ${clubId}`);
+
+        const clubRef = doc(db, "clubs", clubId);
+        const clubSnap = await getDoc(clubRef);
+
+        if (!clubSnap.exists()) {
+            await showAppAlert("Club not found. It might have already been deleted.");
+            console.warn(`Club with ID ${clubId} not found.`);
+            return;
+        }
+
+        const clubData = clubSnap.data();
+        const managerUid = clubData.managerUid;
+        const joinCode = clubData.joinCode;
+
+        if (managerUid !== currentUser.uid) {
+            await showAppAlert(`You are not authorized to delete this club. Only the club ${ROLE_LABELS.manager.toLowerCase()} can perform this action.`);
+            console.warn(`User ${currentUser.uid} attempted to delete club ${clubId} but is not the manager.`);
+            return;
+        }
+
+        const confirmed = await showAppConfirm("Are you absolutely sure you want to delete this club? This action cannot be undone.");
+        if (!confirmed) {
+            console.log("Club deletion cancelled by user.");
+            return;
+        }
+
+        setLoading(deleteButton);
+
+        try {
+            console.log(`Fetching members for club ${clubId} to update their user profiles...`);
+            const membersCollectionRef = collection(db, "clubs", clubId, "members");
+            const memberDocsSnap = await getDocs(membersCollectionRef);
+            const memberUIDsToUpdate = [];
+            memberDocsSnap.forEach((memberDoc) => {
+                memberUIDsToUpdate.push(memberDoc.id);
+            });
+            console.log(`Found ${memberUIDsToUpdate.length} members to update their user profiles.`);
+
+            if (memberUIDsToUpdate.length > 0) {
+                console.log(`Removing club ID ${clubId} from all members' 'member_clubs' lists...`);
+                const updateMemberPromises = memberUIDsToUpdate.map(async (memberUid) => {
+                    if (memberUid === managerUid) return Promise.resolve();
+                    const memberUserDocRef = doc(db, "users", memberUid);
+                    try {
+                        await updateDoc(memberUserDocRef, {
+                            member_clubs: arrayRemove(clubId),
+                            admin_clubs: arrayRemove(clubId)
+                        });
+                    } catch (memberUpdateError) {
+                        console.error(`Error removing club ID from member ${memberUid}'s profile:`, memberUpdateError);
+                    }
+                });
+                await Promise.all(updateMemberPromises);
+                console.log("All members' 'member_clubs' lists updated.");
+            }
+
+            console.log(`Deleting all subcollections for club ${clubId} in parallel...`);
+
+            const deleteMembersPromise = Promise.all(
+                memberDocsSnap.docs.map(memberDoc => deleteDoc(memberDoc.ref))
+            ).then(() => console.log(`  Deleted ${memberDocsSnap.size} doc(s) from members`));
+
+            const otherSubcollectionNames = ['events', 'occurrenceRsvps', 'announcements', 'messages', 'polls', 'resourceSections'];
+            const otherDeletes = otherSubcollectionNames.map(async (name) => {
+                const snap = await getDocs(collection(db, "clubs", clubId, name));
+                await Promise.all(snap.docs.map(d => deleteDoc(d.ref)));
+                console.log(`  Deleted ${snap.size} doc(s) from ${name}`);
+            });
+
+            await Promise.all([deleteMembersPromise, ...otherDeletes]);
+            console.log(`All subcollections deleted for club ${clubId}.`);
+
+            if (joinCode) {
+                console.log(`Deleting join code ${joinCode}...`);
+                const joinCodeRef = doc(db, "join_codes", joinCode);
+                await deleteDoc(joinCodeRef);
+                console.log(`Join code ${joinCode} deleted.`);
+            }
+
+            console.log(`Deleting club document with ID: ${clubId}...`);
+            await deleteDoc(clubRef);
+            console.log(`Club document ${clubId} deleted.`);
+
+            if (clubData.schoolId) {
+                await updateDoc(doc(db, "schools", clubData.schoolId), {
+                    clubs: arrayRemove({ id: clubId, name: clubData.clubName })
+                });
+            }
+
+            console.log(`Removing club ID ${clubId} from manager ${currentUser.uid}'s managed_clubs list...`);
+            const userDocRef = doc(db, "users", currentUser.uid);
+            await updateDoc(userDocRef, {
+                managed_clubs: arrayRemove(clubId)
+            });
+            console.log(`Club ID ${clubId} removed from manager's managed_clubs list.`);
+
+            clearLoading(deleteButton);
+            await showAppAlert(`Club "${clubData.clubName}" has been successfully deleted.`);
+            window.location.href = "your_clubs.html";
+        } catch (deleteInnerError) {
+            clearLoading(deleteButton);
+            throw deleteInnerError;
+        }
+
+    } catch (error) {
+        console.error("Error deleting club:", error);
+        if (isPermissionError(error)) {
+            await showAppAlert(permissionDeniedMessage("delete this club"));
+        } else {
+            await showAppAlert("Something went wrong while deleting your club. Please try again, or contact support if the issue continues.");
+        }
+    }
+}
+
+const states = ['Alabama', 'Alaska', 'Arizona', 'Arkansas', 'California', 'Colorado', 'Connecticut', 'Delaware', 'District of Columbia', 'Florida', 'Georgia', 'Hawaii', 'Idaho', 'Illinois', 'Indiana', 'Iowa', 'Kansas', 'Kentucky', 'Louisiana', 'Maine', 'Maryland', 'Massachusetts', 'Michigan', 'Minnesota', 'Mississippi', 'Missouri', 'Montana', 'Nebraska', 'Nevada', 'New Hampshire', 'New Jersey', 'New Mexico', 'New York', 'North Carolina', 'North Dakota', 'Ohio', 'Oklahoma', 'Oregon', 'Pennsylvania', 'Rhode Island', 'South Carolina', 'South Dakota', 'Tennessee', 'Texas', 'Utah', 'Vermont', 'Virginia', 'Washington', 'West Virginia', 'Wisconsin', 'Wyoming', 'Puerto Rico', 'Guam', 'U.S. Virgin Islands', 'American Samoa', 'Northern Mariana Islands'];
+
+
+const NO_COUNTY_STATES = {
+    'District of Columbia': { fips: '11001', name: 'District of Columbia' },
+    'Puerto Rico': { fips: null, name: 'Puerto Rico' },
+    'Guam': { fips: null, name: 'Guam' },
+    'U.S. Virgin Islands': { fips: null, name: 'U.S. Virgin Islands' },
+    'American Samoa': { fips: null, name: 'American Samoa' },
+    'Northern Mariana Islands': { fips: null, name: 'Northern Mariana Islands' },
+};
+
+function handleCountyVisibility(stateName) {
+    const noCounty = NO_COUNTY_STATES[stateName];
+    if (!stateName) {
+        countyInput.closest('.club-form-section').style.display = 'none';
+        countyInput.value = '';
+        selectedCountyFips = null;
+    } else if (noCounty) {
+        countyInput.value = noCounty.name;
+        selectedCountyFips = noCounty.fips;
+        countyInput.disabled = true;
+        countyInput.closest('.club-form-section').style.display = 'none';
+    } else {
+        countyInput.value = '';
+        selectedCountyFips = null;
+        countyInput.disabled = false;
+        countyInput.closest('.club-form-section').style.display = '';
+    }
+}
+
+const STATE_ABBREVS = {
+    'AL':'Alabama','AK':'Alaska','AZ':'Arizona','AR':'Arkansas','CA':'California',
+    'CO':'Colorado','CT':'Connecticut','DE':'Delaware','FL':'Florida','GA':'Georgia',
+    'HI':'Hawaii','ID':'Idaho','IL':'Illinois','IN':'Indiana','IA':'Iowa',
+    'KS':'Kansas','KY':'Kentucky','LA':'Louisiana','ME':'Maine','MD':'Maryland',
+    'MA':'Massachusetts','MI':'Michigan','MN':'Minnesota','MS':'Mississippi',
+    'MO':'Missouri','MT':'Montana','NE':'Nebraska','NV':'Nevada','NH':'New Hampshire',
+    'NJ':'New Jersey','NM':'New Mexico','NY':'New York','NC':'North Carolina',
+    'ND':'North Dakota','OH':'Ohio','OK':'Oklahoma','OR':'Oregon','PA':'Pennsylvania',
+    'RI':'Rhode Island','SC':'South Carolina','SD':'South Dakota','TN':'Tennessee',
+    'TX':'Texas','UT':'Utah','VT':'Vermont','VA':'Virginia','WA':'Washington',
+    'WV':'West Virginia','WI':'Wisconsin','WY':'Wyoming',
+    'DC': 'District of Columbia',
+    'D.C.': 'District of Columbia',
+};
+
+function normalizeState(input) {
+    const trimmed = input.trim();
+    const upper = trimmed.toUpperCase();
+
+    const abbrevKey = upper.replace(/\./g, ''); 
+    if (STATE_ABBREVS[abbrevKey]) return STATE_ABBREVS[abbrevKey];
+    if (STATE_ABBREVS[upper]) return STATE_ABBREVS[upper];
+
+    const stripped = trimmed.toLowerCase().replace(/[,\.]/g, '').replace(/\s+/g, ' ').trim();
+    if (
+        stripped === 'washington dc' ||
+        stripped === 'washington d c' ||
+        stripped === 'washington district of columbia' ||
+        stripped === 'district of columbia'
+    ) {
+        return 'District of Columbia';
+    }
+
+    return states.find(s => s.toLowerCase() === trimmed.toLowerCase()) || null;
+}
+
+
+const stateDropdownList = document.getElementById('state-dropdown-list-edit');
+
+stateInput.addEventListener('input', function() {
+    const value = this.value.toLowerCase();
+    stateDropdownList.innerHTML = '';
+
+    const fullNameMatch = states.find(s => s.toLowerCase() === value.trim());
+    handleCountyVisibility(fullNameMatch || '');
+
+    if (value) {
+        const normalized = normalizeState(this.value.trim());
+        const filtered = states.filter(state =>
+        state.toLowerCase().includes(value) ||
+        (normalized && state === normalized)
+        );
+        if (filtered.length > 0) {
+            filtered.forEach(state => {
+                const div = document.createElement('div');
+                div.className = 'state-option';
+                div.textContent = state;
+                div.onclick = () => {
+                    stateInput.value = state;
+                    stateDropdownList.classList.remove('show');
+                    countyDropdownList.innerHTML = '';
+                    countyDropdownList.classList.remove('show');
+                    handleCountyVisibility(state);
+                };
+                stateDropdownList.appendChild(div);
+            });
+            stateDropdownList.classList.add('show');
+        } else {
+            stateDropdownList.classList.remove('show');
+        }
+    } else {
+        stateDropdownList.classList.remove('show');
+        handleCountyVisibility('');
+    }
+});
+
+
+document.addEventListener('click', function(e) {
+    if (!stateInput.contains(e.target) && !stateDropdownList.contains(e.target)) {
+        stateDropdownList.classList.remove('show');
+    }
+});
+
+
+countyInput.addEventListener('input', function() {
+    const value = this.value.toLowerCase();
+    const currentState = normalizeState(stateInput.value.trim());
+    countyDropdownList.innerHTML = '';
+
+    let pool = currentState
+        ? COUNTIES.filter(c => c.state === currentState)
+        : COUNTIES;
+
+    if (value) {
+        pool = pool.filter(c => c.name.toLowerCase().includes(value));
+    }
+
+    if (pool.length > 0) {
+        pool.forEach(county => {
+            const div = document.createElement('div');
+            div.className = 'state-option';
+            div.textContent = county.name;
+            div.onclick = () => {
+                countyInput.value = county.name;
+                selectedCountyFips = county.fips;
+                countyDropdownList.classList.remove('show');
+                loadSchoolsFor(normalizeState(stateInput.value), county.name);
+            };
+            countyDropdownList.appendChild(div);
+        });
+        countyDropdownList.classList.add('show');
+    } else {
+        countyDropdownList.classList.remove('show');
+    }
+});
+
+document.addEventListener('click', function(e) {
+    if (!countyInput.contains(e.target) && !countyDropdownList.contains(e.target)) {
+        countyDropdownList.classList.remove('show');
+    }
+});
+
+
+const schoolDropdownList = document.getElementById('school-dropdown-list-edit');
+
+schoolNameInput.addEventListener('input', function() {
+    const value = this.value.toLowerCase();
+    schoolDropdownList.innerHTML = '';
+
+    const pool = CACHED_SCHOOLS.filter(s => s.nameLower.includes(value));
+
+    if (value && pool.length > 0) {
+        pool.forEach(school => {
+            const div = document.createElement('div');
+            div.className = 'state-option';
+            div.textContent = school.name;
+            div.onclick = () => {
+                schoolNameInput.value = school.name;
+                schoolDropdownList.classList.remove('show');
+            };
+            schoolDropdownList.appendChild(div);
+        });
+        schoolDropdownList.classList.add('show');
+    } else {
+        schoolDropdownList.classList.remove('show');
+    }
+});
+
+document.addEventListener('click', function(e) {
+    if (!schoolNameInput.contains(e.target) && !schoolDropdownList.contains(e.target)) {
+        schoolDropdownList.classList.remove('show');
+    }
+});
+
+
+function showContainerError(message, showRetry = false, topMargin = '165px') {
+    const content = document.getElementById('content');
+    if (!content) return;
+    content.innerHTML = `
+        <div class="revealed-child" style="text-align: center; padding: 20px; margin-top: ${topMargin};">
+            <p class="fancy-label">${message}</p>
+            <div style="display: flex; justify-content: center; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
+                ${showRetry
+                    ? `<button type="button" class="fancy-button" onclick="window.location.reload()" style="font-size: 24px;">TRY AGAIN</button>`
+                    : `<button type="button" class="fancy-button" onclick="window.location.href='your_clubs.html'" style="font-size: 24px;">GO TO MY CLUBS</button>`
+                }
+            </div>
+        </div>
+    `;
+}
+
+function isPermissionError(error) {
+    return error && error.code === 'permission-denied';
+}
+
+function permissionDeniedMessage(actionPhrase) {
+    return `You don't have permission to ${actionPhrase}. Try reloading the page, and reach out to a club ${ROLE_LABELS.manager.toLowerCase()} if you think this is a mistake.`;
+}

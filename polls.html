@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <link href="styles.css?v=76" rel="stylesheet" />
+    <meta name="theme-color" id="theme-color-meta" content="#1c375f">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Club Connect | Polls</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=New+Amsterdam&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Teko:wght@300..700&display=swap" rel="stylesheet">
+    <link href="polls.css?v=24" rel="stylesheet" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    
+    <style>
+        .empty-state-card-dashed.static {
+            margin-top: -45px !important;
+        }
+
+        .editing-poll-card-first {
+            margin-top: -45px !important;
+        }
+    </style>
+    
+  </head>
+  <body>
+    <div id="loading-overlay">
+        <div id="loading-overlay-inner">
+            <div class="loading-spinner"></div>
+            <p>LOADING...</p>
+        </div>
+    </div>
+    <div class="chat-header">
+        <button id="back-button" class="fancy-button" onclick="goToClubPage()">
+            <i class="fa-solid fa-circle-left"></i>
+        </button>
+        <span class="chat-title">POLLS</span>
+    </div>
+    <div id="content">
+        <h1 id="clubScheduleTitle"></h1>
+        <button id="add-poll-button" class="fancy-button" style="display: none;">NEW POLL</button>
+
+        <div id="polls-container"></div>
+        <p id="no-polls-message" class="fancy-label" style="display: none;"></p>
+        <div id="no-polls-message-admin" class="empty-state-card-dashed static" style="display: none;">
+            <i class="fa-solid fa-square-poll-vertical"></i>
+            <p class="empty-state-dashed-title">No polls created yet</p>
+            <p class="empty-state-dashed-subtitle">Ask your members where they stand</p>
+            <button id="empty-state-poll-btn" class="fancy-button">NEW POLL</button>
+        </div>
+
+        <div id="popup-overlay" style="display: none;"></div>
+        <div id="poll-creation-modal" style="display: none;">
+            <h3>CREATE POLL</h3>
+            <label style="display:block; font-size:20px; margin-bottom:8px; text-align:left;">Title</label>
+            <textarea class="poll-option-input" id="poll-title-input" placeholder="Poll title..." rows="1" style="width:100%; box-sizing:border-box;"></textarea>
+            <div class="poll-options-selection">
+                <label>Show results to voter:</label>
+                <div class="checkbox-group">
+                    <label>
+                        <input type="radio" name="poll-option" value="Before" checked>
+                        Before vote
+                    </label>
+                    <label>
+                        <input type="radio" name="poll-option" value="After">
+                        After vote
+                    </label>
+                    <label>
+                        <input type="radio" name="poll-option" value="Never">
+                        Never
+                    </label>
+                </div>
+                <label id="poll-type-info" class = "gray-label" >Users will always see poll percentages. The creator of the poll can always see results.</label>
+            </div>
+            <div id="poll-options-container">
+                <label style="display:block; font-size:20px; margin-bottom:8px; text-align:left;">Options</label>
+                <div id="poll-options-list">
+                    <div class="poll-option-row">
+                        <textarea class="poll-option-input" placeholder="Option 1" rows="1"></textarea>
+                    </div>
+                    <div class="poll-option-row">
+                        <textarea class="poll-option-input" placeholder="Option 2" rows="1"></textarea>
+                    </div>
+                </div>
+                <button id="subtract-option-btn" onclick="subtractPollOption()">REMOVE OPTION -</button>
+                <button id="add-option-btn" onclick="addPollOption()">ADD OPTION +</button>
+                <div class="poll-creation-actions">
+                    <button id="post-poll-button" class="fancy-button">POST</button>
+                    <button id="cancel-poll-button" class="fancy-button">CANCEL</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <div id="poll-edit-modal" style="display: none;">
+        <h3>EDIT VISIBILITY</h3>
+        <div class="poll-options-selection">
+            <label>Show results to voter:</label>
+            <div class="checkbox-group">
+                <label>
+                    <input type="radio" name="poll-edit-option" value="Before" checked>
+                    Before vote
+                </label>
+                <label>
+                    <input type="radio" name="poll-edit-option" value="After">
+                    After vote
+                </label>
+                <label>
+                    <input type="radio" name="poll-edit-option" value="Never">
+                    Never
+                </label>
+            </div>
+            <label id="poll-edit-type-info" class = "gray-label">Users will always see poll percentages. The creator of the poll and manager can always see results.</label>
+        </div>
+        <div class="poll-creation-actions">
+            <button id="save-poll-edit-button" class="fancy-button">SAVE</button>
+            <button id="cancel-poll-edit-button" class="fancy-button">CANCEL</button>
+        </div>
+    </div>
+
+    <script src="theme.js?v=12"></script>
+    <script type="module" src="dialog.js?v=3"></script> 
+    <script type="module" src="polls.js?v=27"></script>
+    <!-- <script type="module" src="loading.js?v=2"></script> -->
+  </body>
+</html>
+ 
+
+
