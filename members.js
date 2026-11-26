@@ -408,10 +408,21 @@ function openRoleManagementPopup(memberUid, memberName, currentRole) {
     memberNameForRoleDisplay.textContent = `${memberName}`;
     roleSelect.value = currentRole;
 
-    const managerOption = roleSelect.querySelector('option[value="manager"]');
+    let managerOption = roleSelect.querySelector('option[value="manager"]');
     const memberOption = roleSelect.querySelector('option[value="member"]');
-
-    managerOption.hidden = role !== 'manager';
+    
+    // Remove Manager option for admins
+    if (role !== 'manager') {
+        managerOption?.remove();
+    }
+    
+    // Restore Manager option for the actual manager
+    else if (!managerOption) {
+        managerOption = document.createElement('option');
+        managerOption.value = 'manager';
+        managerOption.textContent = ROLE_LABELS.manager;
+        roleSelect.appendChild(managerOption);
+    }
     
     memberOption.hidden = role === 'admin' && currentRole === 'admin';
 
