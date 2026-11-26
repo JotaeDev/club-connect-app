@@ -412,7 +412,6 @@ function openRoleManagementPopup(memberUid, memberName, currentRole) {
     const memberOption = roleSelect.querySelector('option[value="member"]');
 
     managerOption.hidden = role !== 'manager';
-    
     memberOption.hidden = role === 'admin' && currentRole === 'admin';
 
     updateTransferConfirmRow();
