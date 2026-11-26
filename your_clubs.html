@@ -133,7 +133,7 @@
 				box-shadow: 0px 2px 0px #000000;
 				background: linear-gradient(#ffffff, #f7f7f7);
 				cursor: pointer;
-				overflow: hidden;
+				overflow: visible;
 				font-family: var(--primary-font-family);
 				color: #111;
 				box-sizing: border-box;
@@ -142,6 +142,39 @@
 				-webkit-tap-highlight-color: transparent;
 				transition: transform 0.05s ease-in-out, box-shadow 0.05s ease-in-out, filter 0.05s ease-in-out;
 				position: relative;
+			}
+
+			.notification-badge {
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+				gap: 6px;
+			}
+
+			.notification-icon {
+				font-size: 14px !important;
+				display: inline-block;
+				overflow: hidden;
+				white-space: nowrap;
+				transform-origin: center;
+				animation: notification-icon-shrink 0.6s
+					cubic-bezier(0.4, 0, 0.2, 1) 0.8s forwards;
+			}
+
+			@keyframes notification-icon-shrink {
+				0% {
+					width: 1em;
+					opacity: 1;
+					transform: scale(1);
+					margin-right: 0;
+				}
+
+				100% {
+					width: 0;
+					opacity: 0;
+					transform: scale(0.5);
+					margin-right: -6px;
+				}
 			}
 
 			.club-btn:hover {
@@ -216,6 +249,15 @@
 			.club-card-meta i {
 				font-size: 16px;
 				color: #888;
+			}
+
+			.cc-card-inner {
+				position: relative;
+			}
+
+			.notification-badge.badge-visible {
+				display: flex;
+				animation: badge-pop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
 			}
 
 			.cc-card-arrow { display: none; }
@@ -387,7 +429,7 @@
 
 		<script src="theme.js?v=12"></script>
 		<script type="module" src="dialog.js?v=3"></script>
-		<script type="module" src="your_clubs.js?v=38"></script>
+		<script type="module" src="your_clubs.js?v=39"></script>
 
 	</body>
 </html>

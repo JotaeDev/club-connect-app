@@ -87,21 +87,28 @@ function capitalizeFirstLetter(str) {
 }
 
 
-function buildCardHTML(clubName, roleLabel, memberCount) {
-  return `
-    <div class="cc-card-inner">
-      <div class="cc-card-body">
-        <span class="club-card-name">${escapeHtml(clubName)}</span>
-        <div class="cc-card-meta-row">
-          <span class="club-role-pill">${roleLabel}</span>
-          <span class="club-card-meta">
-            <i class="fa-solid fa-users"></i>
-            ${memberCount}
-          </span>
+function buildCardHTML(clubName, roleLabel, memberCount, pendingRequestCount = 0) {
+    return `
+        <div class="cc-card-inner">
+            <div class="cc-card-body">
+                <span class="club-card-name">${escapeHtml(clubName)}</span>
+                <div class="cc-card-meta-row">
+                    <span class="club-role-pill">${roleLabel}</span>
+                    <span class="club-card-meta">
+                        <i class="fa-solid fa-users"></i>
+                        ${memberCount}
+                    </span>
+                </div>
+            </div>
+
+            ${pendingRequestCount > 0 ? `
+                <span class="notification-badge badge-visible">
+                    <span class="notification-count">${pendingRequestCount}</span>
+                    <i class="notification-icon fa-solid fa-user"></i>
+                </span>
+            ` : ''}
         </div>
-      </div>
-    </div>
-  `;
+    `;
 }
 
 async function loadAllClubs() {
@@ -148,7 +155,8 @@ async function loadAllClubs() {
             btn.dataset.clubId = managedClubs[i];
             btn.style.animationDelay = `${cardIndex * 100}ms`;
             btn.style.setProperty('--accent', ACCENT.manager);
-            btn.innerHTML = buildCardHTML(data.clubName, ROLE_LABELS.manager, memberCount);
+            const pendingRequestCount = (data.pendingMemberUIDs || []).length;
+            btn.innerHTML = buildCardHTML(data.clubName, ROLE_LABELS.manager, memberCount, pendingRequestCount);
             btn.addEventListener("click", () => {
                 window.location.href = `club_page.html?clubId=${managedClubs[i]}`;
             });
@@ -182,7 +190,10 @@ async function loadAllClubs() {
             btn.dataset.userRole = role;
             btn.style.animationDelay = `${cardIndex * 100}ms`;
             btn.style.setProperty('--accent', accentColor);
-            btn.innerHTML = buildCardHTML(data.clubName, getRoleLabel(role), memberCount);
+            const pendingRequestCount = role === 'admin'
+                ? (data.pendingMemberUIDs || []).length
+                : 0;
+            btn.innerHTML = buildCardHTML(data.clubName, getRoleLabel(role), memberCount, pendingRequestCount);
             btn.addEventListener("click", () => {
                 window.location.href = `club_page.html?clubId=${id}`;
             });
